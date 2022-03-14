@@ -1,16 +1,21 @@
+![Gif](./frontend.gif)
+
 cd into directory then
 
-*screen one*
+*terminal 1*
 ```
 npm install
 npx hardhat node
 ```
 
-*get the smart contract address and paste in App.js*
+
+*terminal 2*
 ```
 npx hardhat run scripts/deploy.js --network localhost
 ```
+Copy/paste contract address of smart contract inside App.js
 
+*terminal 3*
 ```
 npm start
 ```
