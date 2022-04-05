@@ -1,23 +1,28 @@
 // Built-in uses
 use std::time::{Duration, Instant};
 // External uses
-use futures::channel::mpsc::{Receiver, Sender};
-use futures::{SinkExt, StreamExt};
+use futures::{channel::mpsc::Receiver, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{task::JoinHandle, time};
-use zksync_crypto::Fr;
-use zksync_types::block::IncompleteBlock;
+
 // Workspace uses
-use crate::mempool::MempoolBlocksRequest;
 use zksync_config::ChainConfig;
+use zksync_crypto::Fr;
 use zksync_storage::ConnectionPool;
+use zksync_token_db_cache::TokenDBCache;
 use zksync_types::{
-    block::{Block, BlockMetadata, ExecutedOperations, PendingBlock},
+    block::{Block, BlockMetadata, ExecutedOperations, IncompleteBlock, PendingBlock},
     AccountUpdates, BlockNumber,
 };
 
 mod aggregated_committer;
 
+// In this component, the most interesting part of the database is decimals,
+// Usually we don't change them, so we can invalidate the cache once an hour.
+const TOKEN_INVALIDATE_CACHE: Duration = Duration::from_secs(60 * 60);
+
+
+// Enumeration of the functions the block gets send to depending on the state of the block
 #[derive(Debug)]
 pub enum CommitRequest {
     PendingBlock((PendingBlock, AppliedUpdatesRequest)),
@@ -30,7 +35,6 @@ pub enum CommitRequest {
 pub struct BlockCommitRequest {
     pub block: IncompleteBlock,
     pub block_metadata: BlockMetadata,
-    pub accounts_updated: AccountUpdates,
 }
 
 #[derive(Clone, Debug)]
@@ -52,12 +56,16 @@ pub struct ExecutedOpsNotify {
 
 const PROOF_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-async fn handle_new_commit_task(
-    mut rx_for_ops: Receiver<CommitRequest>,
-    mut mempool_req_sender: Sender<MempoolBlocksRequest>,
-    pool: ConnectionPool,
-) {
+
+// This function handles the commit of blocks
+// it checks if the status of the block matches certain criteria
+// if it does it gets send to the corresponding funcition.
+async fn handle_new_commit_task(mut rx_for_ops: Receiver<CommitRequest>, pool: ConnectionPool) {
     vlog::info!("Run committer");
+    let mut token_db_cache = TokenDBCache::new(TOKEN_INVALIDATE_CACHE);
+    token_db_cache
+        .fill_token_cache(&mut pool.access_storage().await.unwrap())
+        .await;
     while let Some(request) = rx_for_ops.next().await {
         match request {
             CommitRequest::SealIncompleteBlock((block_commit_request, applied_updates_req)) => {
@@ -65,7 +73,7 @@ async fn handle_new_commit_task(
                     block_commit_request,
                     applied_updates_req,
                     &pool,
-                    &mut mempool_req_sender,
+                    &mut token_db_cache,
                 )
                 .await;
             }
@@ -147,20 +155,21 @@ async fn seal_incomplete_block(
     block_commit_request: BlockCommitRequest,
     applied_updates_request: AppliedUpdatesRequest,
     pool: &ConnectionPool,
-    mempool_req_sender: &mut Sender<MempoolBlocksRequest>,
+    token_db_cache: &mut TokenDBCache,
 ) {
     let start = Instant::now();
     let BlockCommitRequest {
         block,
         block_metadata,
-        accounts_updated,
     } = block_commit_request;
 
+    // connect to database
     let mut storage = pool
         .access_storage()
         .await
         .expect("db connection fail for committer");
 
+    // if connected to database, init trasanction connected to the database 
     let mut transaction = storage
         .start_transaction()
         .await
@@ -178,6 +187,7 @@ async fn seal_incomplete_block(
         total_priority_ops as f64
     );
 
+    // pending block gets commited into te database
     transaction
         .chain()
         .state_schema()
@@ -192,11 +202,12 @@ async fn seal_incomplete_block(
     vlog::info!("seal incomplete block #{}", block.block_number);
 
     let block_number = block.block_number;
-
+    
+    
     transaction
         .chain()
         .block_schema()
-        .save_incomplete_block(block)
+        .save_incomplete_block(&block)
         .await
         .expect("committer must commit the op into db");
 
@@ -207,20 +218,25 @@ async fn seal_incomplete_block(
         .await
         .expect("committer must commit block block metadata into db");
 
-    mempool_req_sender
-        .send(MempoolBlocksRequest::UpdateNonces(accounts_updated))
-        .await
-        .map_err(|e| vlog::warn!("Failed notify mempool about account updates: {}", e))
-        .unwrap_or_default();
-
     transaction
         .commit()
         .await
         .expect("Unable to commit DB transaction");
 
+    // We do this outside of a transaction,
+    // because we want the incomplete block data to be available as soon as possible.
+    // If something happened to the metric count, it won't affect the block data
+    if let Err(err) =
+        zksync_prometheus_exporter::calculate_volume_for_block(&mut storage, &block, token_db_cache)
+            .await
+    {
+        vlog::error!("Can't calculate volume metric: {:?}", err)
+    }
     metrics::histogram!("committer.seal_incomplete_block", start.elapsed());
 }
 
+// this function commits the finished block to the database
+// connects to the database as before with the data stored into the transaction
 async fn finish_block(request: BlockFinishRequest, pool: &ConnectionPool) {
     let start = Instant::now();
     let BlockFinishRequest {
@@ -260,8 +276,10 @@ async fn finish_block(request: BlockFinishRequest, pool: &ConnectionPool) {
         panic!("Received a request to finish block #{}, but there is no root hash for previous block in the database", block_number);
     });
 
+    // here the finish block is stored into block variable
     let block = Block::from_incomplete(incomplete_block, prev_root_hash, root_hash);
 
+    // commit the fiished block to the database
     transaction
         .chain()
         .block_schema()
@@ -297,14 +315,9 @@ async fn poll_for_new_proofs_task(pool: ConnectionPool, config: ChainConfig) {
 #[must_use]
 pub fn run_committer(
     rx_for_ops: Receiver<CommitRequest>,
-    mempool_req_sender: Sender<MempoolBlocksRequest>,
     pool: ConnectionPool,
     config: ChainConfig,
 ) -> JoinHandle<()> {
-    tokio::spawn(handle_new_commit_task(
-        rx_for_ops,
-        mempool_req_sender,
-        pool.clone(),
-    ));
+    tokio::spawn(handle_new_commit_task(rx_for_ops, pool.clone()));
     tokio::spawn(poll_for_new_proofs_task(pool, config))
 }
