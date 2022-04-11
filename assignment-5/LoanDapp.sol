@@ -6,9 +6,11 @@ import "@aztec/protocol/contracts/ERC1724/ZkAsset.sol";
 import "./ZKERC20/ZKERC20.sol";
 import "./Loan.sol";
 
+// this contract represents a decentralized loan app
 contract LoanDapp is IAZTEC {
   using NoteUtils for bytes;
 
+  // events to be emitted
   event SettlementCurrencyAdded(
     uint id,
     address settlementAddress
