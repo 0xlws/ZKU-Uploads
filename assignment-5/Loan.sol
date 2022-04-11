@@ -164,7 +164,7 @@ contract Loan is ZkAssetMintable {
     emit LoanRepaid();
   }
 
-
+  // lender can mark loan as default if the last interest payment date is in the past
   function markLoanAsDefault(bytes memory _proof1, bytes memory _proof2, uint256 _interestDurationToWithdraw) public {
     require(_interestDurationToWithdraw.add(loanVariables.lastInterestPaymentDate) < block.timestamp, 'withdraw is greater than accrued interest');
     LoanUtilities._validateDefaultProofs(_proof1, _proof2, _interestDurationToWithdraw, loanVariables);
